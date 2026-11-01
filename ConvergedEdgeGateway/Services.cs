@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO.Ports;
 using System.Text.Json;
+using Microsoft.AspNetCore.SignalR;
 using MQTTnet;
 using MQTTnet.Server;
 
@@ -21,16 +22,25 @@ public record TelemetryData(double Voltage, int Raw, long Timestamp);
 public class SerialBridgeWorker : BackgroundService
 {
     private SerialPort? _serial;
-    private readonly string _portName = "COM3"; // ปรับให้ตรงกับพอร์ตของ ESP32 บนเครื่องคุณ
+    private readonly string _portName = "COM24"; // ปรับให้ตรงกับพอร์ตของ ESP32 บนเครื่องคุณ (COM24)
     private readonly int _baudRate = 115200;
     private readonly GatewayStateStore _store;
     private readonly MqttServer _mqttServer;
     private readonly ILogger<SerialBridgeWorker> _logger;
+    private readonly IHubContext<GatewayHub> _hubContext;
+    private readonly ProtocolMetrics _metrics;
 
-    public SerialBridgeWorker(GatewayStateStore store, MqttServer mqttServer, ILogger<SerialBridgeWorker> logger)
+    public SerialBridgeWorker(
+        GatewayStateStore store,
+        MqttServer mqttServer,
+        IHubContext<GatewayHub> hubContext,
+        ProtocolMetrics metrics,
+        ILogger<SerialBridgeWorker> logger)
     {
         _store = store;
         _mqttServer = mqttServer;
+        _hubContext = hubContext;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -81,27 +91,31 @@ public class SerialBridgeWorker : BackgroundService
     {
         try
         {
-            // ตัวอย่างข้อมูลที่ ESP32 ยิงมา: {"voltage": 1.65, "raw": 2048}
             using var doc = JsonDocument.Parse(line);
             var root = doc.RootElement;
             double v = root.GetProperty("voltage").GetDouble();
             int r = root.GetProperty("raw").GetInt32();
 
-            var telemetry = new TelemetryData(v, r, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-            
-            // 1. อัปเดตลง State Store ในหน่วยความจำ
-            _store.Set("latest_telemetry", telemetry);
+            _metrics.SerialPackets++;
 
-            // 2. แปลงและผลักเข้าสู่ Embedded MQTT Broker
+            // 1. ผลักเข้า MQTT
+            _metrics.MqttMessages++;
             var mqttMsg = new MqttApplicationMessageBuilder()
                 .WithTopic("iot/esp32/telemetry")
                 .WithPayload(line)
-                .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtMostOnce)
                 .Build();
-
             await _mqttServer.InjectApplicationMessage(new InjectedMqttApplicationMessage(mqttMsg));
+
+            // 2. ผลักเข้า SignalR หาหน้าเว็บทันที!
+            _metrics.SignalRPushes++;
+            await _hubContext.Clients.All.SendAsync("ReceiveTelemetry", new
+            {
+                voltage = v,
+                raw = r,
+                metrics = _metrics
+            });
         }
-        catch { /* หากไม่ใช่ JSON ให้ข้ามไป */ }
+        catch { }
     }
 
     // ฟังก์ชันส่งคำสั่งย้อนกลับไปหาบอร์ดทาง Serial
